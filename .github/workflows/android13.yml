@@ -1,0 +1,196 @@
+name: G98 Android13 khadas
+
+on:
+  push:
+    branches:
+      - master
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: "选择要构建的内容"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - uboot
+          - kernel
+          - android
+env:
+  TZ: Asia/Shanghai
+  ACTIONS_STEP_DEBUG: true
+  BUILD_TARGET: ${{ inputs.build_target || 'all' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        id: basic_info
+        run: |
+          nproc
+          uname -a
+          cat /etc/*release
+          free -h
+          mount
+          df -h
+          cat /proc/cpuinfo
+          cat /proc/meminfo
+
+      - name: Create simulated physical disk
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6
+          sudo pvcreate /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner.runner /builder
+          sudo apt-get update
+          sudo apt-get install -qq -y device-tree-compiler zip u-boot-tools \
+            python-is-python3 build-essential gcc-aarch64-linux-gnu \
+            acl aptly aria2 axel bc binfmt-support binutils-aarch64-linux-gnu bison \
+            bsdextrautils btrfs-progs build-essential busybox ca-certificates ccache \
+            clang coreutils cpio crossbuild-essential-arm64 cryptsetup curl \
+            debian-archive-keyring debian-keyring debootstrap device-tree-compiler \
+            dialog dirmngr distcc dosfstools dwarves e2fsprogs expect f2fs-tools \
+            fakeroot fdisk file flex gawk gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            gdisk git gnupg gzip htop imagemagick jq kmod lib32ncurses-dev \
+            lib32stdc++6 libbison-dev libc6-dev-armhf-cross libc6-i386 libcrypto++-dev \
+            libelf-dev libfdt-dev libfile-fcntllock-perl libfl-dev libfuse-dev \
+            libgcc-12-dev-arm64-cross libgmp3-dev liblz4-tool libmpc-dev libncurses-dev \
+            libncurses5 libncurses5-dev libncursesw5-dev libpython2.7-dev \
+            libpython3-dev libssl-dev libusb-1.0-0-dev linux-base lld llvm locales \
+            lsb-release lz4 lzma lzop make mtools ncurses-base ncurses-term \
+            nfs-kernel-server ntpdate openssl p7zip p7zip-full parallel parted patch \
+            patchutils pbzip2 pigz pixz pkg-config pv python2 python2-dev python3 \
+            python3-dev python3-distutils python3-pip python3-setuptools \
+            qemu-user-static rar rdfind rename rsync sed \
+            squashfs-tools swig tar tree u-boot-tools udev unzip util-linux uuid \
+            uuid-dev uuid-runtime vim wget whiptail xfsprogs xsltproc xxd xz-utils \
+            zip zlib1g-dev zstd binwalk ripgrep sudo mkbootimg
+          sudo mkdir -p /builder/release/
+          sudo /bin/cp -a ${{ github.workspace }}/* /builder/
+          sudo ln -svf /usr/bin/python3 /usr/bin/python2
+          df -Th
+
+      - name: Build Uboot 2017
+        if: ${{ env.BUILD_TARGET == 'all' || env.BUILD_TARGET == 'uboot' }}
+        working-directory: /builder
+        run: |
+          set -x
+          WORKDIR=`pwd`
+          sudo mkdir -p /builder/release/
+          cd ${WORKDIR}/u-boot
+          ls -alh
+          which python2
+          ./kdev-build-uboot.sh
+          TIMESTAMP=$(date +%Y%m%d)
+          sudo cp uboot.img /builder/release/uboot.img
+          sudo cp uboot.img /builder/release/uboot-${TIMESTAMP}.img
+
+      - name: Upload Uboot to Release
+        if: ${{ env.BUILD_TARGET == 'all' || env.BUILD_TARGET == 'uboot' }}
+        uses: ncipollo/release-action@main
+        with:
+          tag: g98_android13_uboot
+          artifacts: /builder/release/uboot*.img
+          allowUpdates: true
+          removeArtifacts: false
+          replacesArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            # 彼度云 G98 Android13 Uboot
+
+            **测试中，无法引导，不要下载**
+
+            ## 固件下载与刷写指引
+
+            ## 免责声明
+
+            - **按原样提供**：本镜像不作任何明示或暗示的保证，使用风险由用户自行承担。
+            - **无官方关联**：本项目与 Rockchip、彼度云 任何商业实体无关，为非盈利自由分享。
+            - **安全提示**：部署后请及时更新安全补丁、修改默认密码、配置防火墙及访问控制策略。
+
+      - name: Build Kernel 5.10
+        if: ${{ env.BUILD_TARGET == 'all' || env.BUILD_TARGET == 'kernel' }}
+        working-directory: /builder
+        run: |
+          set -x
+          WORKDIR=`pwd`
+          sudo mkdir -p /builder/release/
+          cd ${WORKDIR}/kernel-5.10
+          ls -alh
+          ./kdev-build-kernel.sh
+          TIMESTAMP=$(date +%Y%m%d)
+          sudo cp boot.img /builder/release/boot.img
+          sudo cp boot.img /builder/release/boot-${TIMESTAMP}.img
+
+      - name: Upload Kernel to Release
+        if: ${{ env.BUILD_TARGET == 'all' || env.BUILD_TARGET == 'kernel' }}
+        uses: ncipollo/release-action@main
+        with:
+          tag: g98_android13_kernel
+          artifacts: /builder/release/boot*.img
+          allowUpdates: true
+          removeArtifacts: false
+          replacesArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            # 彼度云 G98 Android13 Kernel
+
+            **测试中，无法引导，不要下载**
+
+            ## 固件下载与刷写指引
+
+            ## 免责声明
+
+            - **按原样提供**：本镜像不作任何明示或暗示的保证，使用风险由用户自行承担。
+            - **无官方关联**：本项目与 Rockchip、彼度云 任何商业实体无关，为非盈利自由分享。
+            - **安全提示**：部署后请及时更新安全补丁、修改默认密码、配置防火墙及访问控制策略。
+
+      - name: Build Android
+        if: ${{ env.BUILD_TARGET == 'all' || env.BUILD_TARGET == 'android' }}
+        working-directory: /builder
+        run: |
+          set -x
+          WORKDIR=`pwd`
+          sudo mkdir -p /builder/release/
+          cd ${WORKDIR}
+          sudo ./build-update.sh
+          TIMESTAMP=$(date +%Y%m%d)
+          sudo cp rockdev/update.img /builder/release/BDY-G98-Anadoid13-only-emmc.img
+          sudo cp rockdev/update.img /builder/release/BDY-G98-Anadoid13-only-emmc-${TIMESTAMP}.img
+
+      - name: Upload Android13 to Release
+        if: ${{ env.BUILD_TARGET == 'all' || env.BUILD_TARGET == 'android' }}
+        uses: ncipollo/release-action@main
+        with:
+          tag: g98_android13
+          artifacts: /builder/release/BDY-G98-Anadoid*
+          allowUpdates: true
+          removeArtifacts: false
+          replacesArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            # 彼度云 G98 Android13
+
+            ## 固件下载与刷写指引
+
+            ## 免责声明
+
+            - **按原样提供**：本镜像不作任何明示或暗示的保证，使用风险由用户自行承担。
+            - **无官方关联**：本项目与 Rockchip、彼度云 任何商业实体无关，为非盈利自由分享。
+            - **安全提示**：部署后请及时更新安全补丁、修改默认密码、配置防火墙及访问控制策略。
