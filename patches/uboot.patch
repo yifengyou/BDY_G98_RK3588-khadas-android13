@@ -1,0 +1,2116 @@
+diff --git a/arch/arm/dts/kedge2.dts b/arch/arm/dts/kedge2.dts
+new file mode 100644
+index 00000000000..2b11cb68e9e
+--- /dev/null
++++ b/arch/arm/dts/kedge2.dts
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright (c) 2023 Khadas Electronics Co., Ltd
++ *
++ */
++
++/dts-v1/;
++#include "rk3588.dtsi"
++#include "rk3588-u-boot.dtsi"
++#include <dt-bindings/input/input.h>
++
++/ {
++	model = "Khadas Board";
++	compatible = "khadas,edge2", "rockchip,rk3588";
++
++	adc-keys {
++		compatible = "adc-keys";
++		io-channels = <&saradc 1>;
++		io-channel-names = "buttons";
++		keyup-threshold-microvolt = <1800000>;
++		u-boot,dm-pre-reloc;
++		status = "okay";
++
++		volumeup-key {
++			u-boot,dm-pre-reloc;
++			linux,code = <KEY_VOLUMEUP>;
++			label = "volume up";
++			press-threshold-microvolt = <1750>;
++		};
++	};
++};
++
++&i2c2 {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c2m0_xfer>;
++};
++
++&i2c6 {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c6m0_xfer>;
++};
+\ No newline at end of file
+diff --git a/arch/arm/dts/rk3588-u-boot.dtsi b/arch/arm/dts/rk3588-u-boot.dtsi
+index d0b82f64b72..04667cbc09e 100644
+--- a/arch/arm/dts/rk3588-u-boot.dtsi
++++ b/arch/arm/dts/rk3588-u-boot.dtsi
+@@ -166,7 +166,7 @@
+ &sdmmc {
+ 	bus-width = <4>;
+ 	u-boot,dm-spl;
+-	cd-gpios = <&gpio0 RK_PA4 GPIO_ACTIVE_HIGH>;
++//	cd-gpios = <&gpio0 RK_PA4 GPIO_ACTIVE_HIGH>;
+ 	status = "okay";
+ };
+ 
+diff --git a/arch/arm/include/asm/arch-rockchip/boot_mode.h b/arch/arm/include/asm/arch-rockchip/boot_mode.h
+index 063fd6b4713..69986cadd46 100644
+--- a/arch/arm/include/asm/arch-rockchip/boot_mode.h
++++ b/arch/arm/include/asm/arch-rockchip/boot_mode.h
+@@ -25,6 +25,8 @@
+ #define BOOT_DFU                (REBOOT_FLAG + 13)
+ /* reboot system quiescent */
+ #define BOOT_QUIESCENT		(REBOOT_FLAG + 14)
++/* enter reboot test mode */
++#define BOOT_REBOOT_TEST        (REBOOT_FLAG + 15)
+ /* enter bootrom download mode */
+ #define BOOT_BROM_DOWNLOAD	0xEF08A53C
+ 
+diff --git a/arch/arm/mach-rockchip/board.c b/arch/arm/mach-rockchip/board.c
+index 00a705c2084..f07c66c292e 100644
+--- a/arch/arm/mach-rockchip/board.c
++++ b/arch/arm/mach-rockchip/board.c
+@@ -62,6 +62,7 @@ static ulong orig_images_ep;
+ 
+ __weak int rk_board_late_init(void)
+ {
++	run_command("gpio clear 138; gpio set 139; gpio clear 140;", 0);
+ 	return 0;
+ }
+ 
+@@ -87,6 +88,8 @@ __weak int set_armclk_rate(void)
+ 
+ __weak int rk_board_init(void)
+ {
++	run_command("gpio set 130", 0);//GPIO4_A2 vcc 5v
++        run_command("gpio set 100", 0);//GPIO3_A4 TYPEC0_PWR_EN
+ 	return 0;
+ }
+ 
+diff --git a/arch/arm/mach-rockchip/boot_mode.c b/arch/arm/mach-rockchip/boot_mode.c
+index 6f4858bbada..f2f301cb0fa 100644
+--- a/arch/arm/mach-rockchip/boot_mode.c
++++ b/arch/arm/mach-rockchip/boot_mode.c
+@@ -206,6 +206,10 @@ int rockchip_get_boot_mode(void)
+ 			printf("boot mode: quiescent\n");
+ 			boot_mode[PL] = BOOT_MODE_QUIESCENT;
+ 			break;
++		case BOOT_REBOOT_TEST:
++			printf("boot mode: reboot test\n");
++			boot_mode[PL] = BOOT_MODE_REBOOT_TEST;
++			break;
+ 		default:
+ 			printf("boot mode: None\n");
+ 			boot_mode[PL] = BOOT_MODE_UNDEFINE;
+@@ -257,12 +261,17 @@ int setup_boot_mode(void)
+ 	case BOOT_MODE_LOADER:
+ 		printf("enter Rockusb!\n");
+ 		env_set("preboot", "setenv preboot; download");
++		run_command("gpio clear 138; gpio clear 139; gpio set 140;", 0);
+ 		run_command("download", 0);
+ 		break;
+ 	case BOOT_MODE_CHARGING:
+ 		printf("enter charging!\n");
+ 		env_set("preboot", "setenv preboot; charge");
+ 		break;
++	case BOOT_MODE_REBOOT_TEST:
++		printf("enter reboot test mode!\n");
++		env_set("reboot_mode", "reboot_test");
++		break;
+ 	}
+ 
+ 	return 0;
+diff --git a/arch/arm/mach-rockchip/boot_rkimg.c b/arch/arm/mach-rockchip/boot_rkimg.c
+index 3e133fbc725..4c4c12b38bc 100644
+--- a/arch/arm/mach-rockchip/boot_rkimg.c
++++ b/arch/arm/mach-rockchip/boot_rkimg.c
+@@ -561,10 +561,47 @@ static int dtb_scan(void *fdt, int where)
+ 	return -EINVAL;
+ }
+ 
++#define DEFAULT_LOAD_ENV_ADDR   (0x0a200000)
++#define DEFAULT_ENV_FILE_SIZE   (0x107b4a)
++#define DEFAULT_LOAD_DTBO_ADDR  (0x5000000)
+ int rockchip_read_dtb_file(void *fdt)
+ {
+-	int locate, ret;
+-	int size;
++    int locate, ret;
++    int size;
++    char env_buf[256] = {'\0'};
++    char * env_addr = env_get("ramdisk_addr_r");
++    char * file_size = env_get("filesize_s");
++    unsigned long load_env_addr = 0;
++    unsigned long env_size = 0;
++    int loadEnvFile = 0;
++
++    if (strict_strtoul(env_addr, 16, &load_env_addr) < 0) {
++        printf("Get ramdisk_addr_r failed, set default.\n");
++        load_env_addr = DEFAULT_LOAD_ENV_ADDR;
++    }
++
++    if (strict_strtoul(file_size, 16, &env_size) < 0) {
++        printf("Get filesize_s failed, set default.\n");
++        env_size = DEFAULT_ENV_FILE_SIZE;
++    }
++
++    /* load uEnv.txt */
++    snprintf(env_buf, sizeof(env_buf), "load mmc 0:9 0x%lx  /boot/dtb/rockchip/rk3588s-khadas-edge2.dtb.overlay.env", load_env_addr);
++    printf("cmd:%s\n", env_buf);
++    ret = run_command(env_buf, 0);
++    if (!ret) {
++        memset(env_buf, 0, sizeof(env_buf));
++        snprintf(env_buf, sizeof(env_buf), "env import -t 0x%lx 0x%lx", load_env_addr, env_size);
++        printf("cmd:%s\n", env_buf);
++        ret = run_command(env_buf, 0);
++        if (ret) {
++            printf("env import failed\n");
++        } else {
++            loadEnvFile = 1;
++        }
++    } else {
++        printf("load /boot/dtb/rockchip/rk3588s-khadas-edge2.dtb.overlay.env failed\n");
++    }
+ 
+ 	for (locate = 0; locate < LOCATE_END; locate++) {
+ 		ret = dtb_scan(fdt, locate);
+@@ -582,12 +619,61 @@ int rockchip_read_dtb_file(void *fdt)
+ 		ALIGN(size, RK_BLK_SIZE) + CONFIG_SYS_FDT_PAD))
+ 		return -ENOMEM;
+ 
+-	/* fixup/overlay */
+-	rk_board_early_fdt_fixup(fdt);
++    printf("loadEnvFile = %d\n", loadEnvFile);
++
++    if(loadEnvFile) {
++        char * overlays = env_get("fdt_overlays");
++        char * setoverlays = NULL;
++        char * ptr = NULL;
++        char cmd_buf[256] = {'\0'};
++        char * dtbo_env_addr = env_get("fdtbo_addr_r");
++        unsigned long load_dtbo_addr = 0;
++
++        if (strict_strtoul(dtbo_env_addr, 16, &load_dtbo_addr) < 0) {
++            printf("Get dtbo_env_addr failed, set default.\n");
++            load_dtbo_addr = DEFAULT_LOAD_DTBO_ADDR;
++        }
++
++        if (NULL != overlays) {
++            setoverlays = (char *)malloc(strlen(overlays)+1);
++            memset(setoverlays, 0, strlen(overlays)+1);
++            memcpy(setoverlays, overlays, strlen(overlays));
++            if (NULL != setoverlays) {
++                ptr = strtok(setoverlays, " ");
++                while(ptr != NULL && strlen(ptr) != 0){
++                    printf("ptr:%s\n", ptr);
++                    memset(cmd_buf, 0, sizeof(cmd_buf));
++                    snprintf(cmd_buf, sizeof(cmd_buf), "load mmc 0:9 0x%lx  /boot/dtb/rockchip/rk3588s-khadas-edge2.dtb.overlays/%s.dtbo", load_dtbo_addr, ptr);
++                    printf("cmd:%s\n", cmd_buf);
++                    ret = run_command(cmd_buf, 0);
++                    if (!ret) {
++                        ret = fdt_increase_size(fdt, fdt_totalsize((void *)load_dtbo_addr));
++                        if (!ret) {
++                            ret = fdt_overlay_apply(fdt, (void *)load_dtbo_addr);
++                            if (!ret) {
++                                printf("Android: fdt overlay OK\n");
++                            } else {
++                                printf("Android: fdt overlay failed, ret=%d\n", ret);
++                            }
++                        } else {
++                            printf("Android: run fdt increase failed\n");
++                        }
++                    } else {
++                        printf("Android: run command failed\n");
++                    }
++                    ptr = strtok(NULL, " ");
++                }
++            }
++            free(setoverlays);
++            setoverlays = NULL;
++        }
++    } else {
++        /* fixup/overlay */
++        rk_board_early_fdt_fixup(fdt);
+ #if defined(CONFIG_ANDROID_BOOT_IMAGE) && defined(CONFIG_OF_LIBFDT_OVERLAY)
+-	android_fdt_overlay_apply((void *)fdt);
++        android_fdt_overlay_apply((void *)fdt);
+ #endif
+-
++    }
+ 	return 0;
+ }
+ #endif
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index 1efdeae6c6f..894815fb1db 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -1732,4 +1732,14 @@ config CMD_UBIFS
+ 	help
+ 	  UBIFS is a file system for flash devices which works on top of UBI.
+ 
++menu "Khadas commands"
++
++config CMD_KHADAS_KBI
++	bool "support khadas kbi"
++	default n
++	help
++      support config for khadas kbi
++
++endmenu
++
+ endmenu
+diff --git a/cmd/Makefile b/cmd/Makefile
+index d4c12a3cc3f..f92a398c0d7 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -167,6 +167,7 @@ obj-$(CONFIG_CMD_GPT) += gpt.o
+ obj-$(CONFIG_CMD_ETHSW) += ethsw.o
+ 
+ obj-$(CONFIG_OPTEE_CLIENT) += optee.o
++obj-$(CONFIG_CMD_KHADAS_KBI) += kbi.o
+ 
+ # Power
+ obj-$(CONFIG_CMD_PMIC) += pmic.o
+diff --git a/cmd/boot.c b/cmd/boot.c
+index 3f96c3202fe..83cb88930cf 100644
+--- a/cmd/boot.c
++++ b/cmd/boot.c
+@@ -13,6 +13,8 @@
+ #include <net.h>
+ #include <asm/io.h>
+ #include <asm/arch/boot_mode.h>
++#include <i2c.h>
++#include <dm.h>
+ 
+ #ifdef CONFIG_CMD_GO
+ 
+@@ -69,6 +71,14 @@ static int do_reboot_brom(cmd_tbl_t *cmdtp, int flag, int argc, char * const arg
+ 	return 0;
+ }
+ 
++static int do_reboot_boot_mode(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[])
++{
++	run_command("i2c dev 2", 0);
++	run_command("i2c mw 0x18 0x91 2 1", 0);
++	do_reset(cmdtp, flag, argc, argv);
++	return 0;
++}
++
+ U_BOOT_CMD_ALWAYS(
+ 	rbrom, 1, 0,	do_reboot_brom,
+ 	"Perform RESET of the CPU",
+@@ -76,13 +86,13 @@ U_BOOT_CMD_ALWAYS(
+ );
+ 
+ U_BOOT_CMD(
+-	reset, 2, 0,    do_reset,
++	reset, 2, 0,    do_reboot_boot_mode,
+ 	"Perform RESET of the CPU",
+ 	""
+ );
+ 
+ U_BOOT_CMD(
+-        reboot, 2, 0,    do_reset,
++        reboot, 2, 0,    do_reboot_boot_mode,
+         "Perform RESET of the CPU, alias of 'reset'",
+         ""
+ );
+diff --git a/cmd/kbi.c b/cmd/kbi.c
+new file mode 100644
+index 00000000000..6e0227a4344
+--- /dev/null
++++ b/cmd/kbi.c
+@@ -0,0 +1,718 @@
++#include <common.h>
++#include <bootretry.h>
++#include <cli.h>
++#include <command.h>
++#include <dm.h>
++#include <edid.h>
++#include <environment.h>
++#include <errno.h>
++#include <i2c.h>
++#include <adc.h>
++#include <malloc.h>
++#include <asm/byteorder.h>
++#include <linux/compiler.h>
++#include <asm/u-boot.h>
++#include "asm/arch-rockchip/vendor.h"
++
++#define CHIP_ADDR              0x18
++#define CHIP_ADDR_CHAR         "0x18"
++#define I2C_SPEED              100000
++#define MCU_I2C_BUS_NUM         2
++
++#define REG_PASSWD_VENDOR       0x00
++#define REG_USID                0x06
++#define REG_VERSION             0x12
++
++#define REG_BOOT_MODE           0x20
++#define REG_BOOT_EN_DCIN        0x21
++#define REG_BOOT_EN_RTC         0x22
++#define REG_LED_ON              0x23
++#define REG_LED_OFF             0x24
++#define REG_LED_RGB_ON_R        0x25
++#define REG_LED_RGB_ON_G        0x26
++#define REG_LED_RGB_ON_B        0x27
++#define REG_LED_RGB_OFF_R       0x28
++#define REG_LED_RGB_OFF_G       0x29
++#define REG_LED_RGB_OFF_B       0x2A
++#define REG_REST_CONF           0x2C
++#define REG_SLEEP_EN            0x2E
++
++#define REG_PWD_WRITE           0x81
++#define REG_PWD_DATA            0x82
++#define REG_LED_ON_RAM          0x89
++#define REG_FAN_CTRL            0x8A
++#define REG_WDT_EN              0x8B
++
++#define REG_SYS_RST             0x91
++#define REG_BOOT_FLAG           0x92
++#define REG_FAN_TEST            0x96
++
++#define BOOT_EN_RTC         1
++#define BOOT_EN_DCIN        2
++
++#define LED_OFF_MODE            0x0
++#define LED_ON_MODE             0x1
++#define LED_R_BREATHE_MODE      0x2
++#define LED_G_BREATHE_MODE      0x3
++#define LED_B_BREATHE_MODE      0x4
++#define LED_RG_BREATHE_MODE     0x5
++#define LED_RB_BREATHE_MODE     0x6
++#define LED_GB_BREATHE_MODE     0x7
++#define LED_RGB_BREATHE_MODE    0x8
++#define LED_R_HEARTBEAT_MODE    0x9
++#define LED_G_HEARTBEAT_MODE    0xa
++#define LED_B_HEARTBEAT_MODE    0xb
++#define LED_RG_HEARTBEAT_MODE   0xc
++#define LED_RB_HEARTBEAT_MODE   0xd
++#define LED_GB_HEARTBEAT_MODE   0xe
++#define LED_RGB_HEARTBEAT_MODE  0xf
++
++#define LED_SYSTEM_OFF      0
++#define LED_SYSTEM_ON       1
++
++#define BOOT_MODE_SPI       0
++#define BOOT_MODE_EMMC      1
++
++#define VERSION_LENGHT        2
++#define USID_LENGHT           7
++#define PASSWD_CUSTOM_LENGHT  6
++#define PASSWD_VENDOR_LENGHT  6
++
++#define BOARD_TYPE_EDGE2    1	/* Single Edge2 Board */
++#define BOARD_TYPE_EDGEV    2
++#define BOARD_TYPE_CAPTAIN  3
++#define BOARD_TYPE_UNKNOW   0
++
++
++extern int vendor_storage_init(void);
++
++static char* LED_MODE_STR[] = {
++	"off",
++	"on",
++	"r_breathe",
++	"g_breathe",
++	"b_breathe",
++	"rg_breathe",
++	"rb_breathe",
++	"gb_breathe",
++	"rgb_breathe",
++	"r_heartbeat",
++	"g_heartbeat",
++	"b_heartbeat",
++	"rg_heartbeat",
++	"rb_heartbeat",
++	"gb_heartbeat",
++	"rgb_heartbeat",
++	"unknown"
++};
++
++static int led_str_to_mode(char *str)
++{
++	int i = 0;
++
++	if (NULL == str)
++		return -1;
++
++	for (i=0; i<sizeof(LED_MODE_STR)/sizeof(char *); i++)
++		if (0 == strcmp(str, LED_MODE_STR[i]))
++			break;
++
++	if (i == sizeof(LED_MODE_STR)/sizeof(char *))
++		return -1;
++	else
++		return i;
++}
++
++#ifdef CONFIG_DM_I2C
++static struct udevice *i2c_cur_bus;
++
++static int cmd_i2c_set_bus_num(unsigned int busnum)
++{
++    struct udevice *bus;
++    int ret;
++
++    ret = uclass_get_device_by_seq(UCLASS_I2C, busnum, &bus);
++    if (ret) {
++        printf("%s: No bus %d\n", __func__, busnum);
++        return ret;
++    }
++    i2c_cur_bus = bus;
++
++    return 0;
++}
++
++static int i2c_get_cur_bus(struct udevice **busp)
++{
++	if (!i2c_cur_bus) {
++		if (cmd_i2c_set_bus_num(MCU_I2C_BUS_NUM)) {
++		    printf("Default I2C bus %d not found\n",
++		           MCU_I2C_BUS_NUM);
++		    return -ENODEV;
++		}
++	}
++
++    if (!i2c_cur_bus) {
++        puts("No I2C bus selected\n");
++        return -ENODEV;
++    }
++    *busp = i2c_cur_bus;
++
++    return 0;
++}
++
++static int i2c_get_cur_bus_chip(uint chip_addr, struct udevice **devp)
++{
++    struct udevice *bus;
++    int ret;
++
++    ret = i2c_get_cur_bus(&bus);
++    if (ret)
++        return ret;
++
++    return i2c_get_chip(bus, chip_addr, 1, devp);
++}
++#endif
++
++static int kbi_i2c_read(uint reg)
++{
++	int ret;
++	char val[64];
++	uchar   linebuf[1];
++	uchar chip;
++#ifdef CONFIG_DM_I2C
++	struct udevice *dev;
++#endif
++
++
++	chip = simple_strtoul(CHIP_ADDR_CHAR, NULL, 16);
++
++#ifdef CONFIG_DM_I2C
++	ret = i2c_get_cur_bus_chip(chip, &dev);
++	if (!ret)
++		ret = dm_i2c_read(dev, reg, (uint8_t *)linebuf, 1);
++#else
++	ret = i2c_read(chip, reg, 1, linebuf, 1);
++#endif
++
++	if (ret)
++		printf("Error reading the chip: %d\n",ret);
++	else {
++		sprintf(val, "%d", linebuf[0]);
++		ret = simple_strtoul(val, NULL, 10);
++
++	}
++	return ret;
++}
++
++static void  kbi_i2c_read_block(uint start_reg, int count, char val[])
++{
++	uint addr;
++	int nbytes;
++	int ret;
++	uchar chip;
++#ifdef CONFIG_DM_I2C
++	struct udevice *dev;
++#endif
++
++	chip = simple_strtoul(CHIP_ADDR_CHAR, NULL, 16);
++
++	nbytes = count;
++	addr = start_reg;
++	do {
++		unsigned char   linebuf[1];
++#ifdef CONFIG_DM_I2C
++		ret = i2c_get_cur_bus_chip(chip, &dev);
++		if (!ret)
++			ret = dm_i2c_read(dev, addr, (uint8_t *)linebuf, 1);
++#else
++		ret = i2c_read(chip, addr, 1, linebuf, 1);
++#endif
++		if (ret)
++			printf("Error reading the chip: %d\n",ret);
++		else
++			val[count-nbytes] =  linebuf[0];
++
++		addr++;
++		nbytes--;
++
++	} while (nbytes > 0);
++}
++
++static void get_version(void)
++{
++	char version[VERSION_LENGHT] = {};
++	int i;
++
++	kbi_i2c_read_block(REG_VERSION, VERSION_LENGHT, version);
++	printf("version: ");
++	for (i=0; i< VERSION_LENGHT; i++) {
++		printf("%02x ",version[i]);
++	}
++	printf("\n");
++}
++
++static void get_usid(void)
++{
++	char serial[64]={0};
++	char usid[USID_LENGHT] = {0};
++
++	kbi_i2c_read_block(REG_USID, USID_LENGHT, usid);
++	sprintf(serial, "%02X%02X%02X%02X%02X%02X%02X",usid[0],usid[1],usid[2],usid[3],usid[4],usid[5],usid[6]);
++	printf("usid:%s\r\n",serial);
++	env_set("usid", serial);
++}
++
++static void get_rtc(void)
++{
++	int enable;
++	enable = kbi_i2c_read(REG_BOOT_EN_RTC);
++	printf("boot rtc: %s\n", enable==1 ? "enable" : "disable" );
++}
++
++static void set_rtc(int enable)
++{
++	char cmd[64];
++	sprintf(cmd, "i2c mw %x %x %d 1",CHIP_ADDR, REG_BOOT_EN_RTC, enable);
++	run_command(cmd, 0);
++
++}
++
++static void get_dcin(void)
++{
++	int enable;
++	enable = kbi_i2c_read(REG_BOOT_EN_DCIN);
++	printf("boot dcin: %s\n", enable==1 ? "enable" : "disable" );
++}
++
++static void set_dcin(int enable)
++{
++	char cmd[64];
++	sprintf(cmd, "i2c mw %x %x %d 1",CHIP_ADDR, REG_BOOT_EN_DCIN, enable);
++	run_command(cmd, 0);
++}
++
++static void get_boot_enable(int type)
++{
++	if (type == BOOT_EN_RTC)
++		get_rtc();
++	else if (type == BOOT_EN_DCIN)
++		get_dcin();
++}
++
++static void set_boot_enable(int type, int enable)
++{
++	if (type == BOOT_EN_RTC)
++		set_rtc(enable);
++	else if (type == BOOT_EN_DCIN)
++		set_dcin(enable);
++}
++
++static void get_led_mode(int type)
++{
++	int mode;
++	if (type == LED_SYSTEM_OFF) {
++		mode = kbi_i2c_read(REG_LED_OFF);
++		if ((mode >= LED_OFF_MODE) && (mode <= LED_RGB_HEARTBEAT_MODE)) {
++			if (LED_ON_MODE == mode || LED_OFF_MODE == mode) {
++				printf("[systemoff] led mode: %s[R:0x%02x G:0x%02x B:0x%02x]\n", LED_MODE_STR[mode],
++						kbi_i2c_read(REG_LED_RGB_OFF_R),
++						kbi_i2c_read(REG_LED_RGB_OFF_G),
++						kbi_i2c_read(REG_LED_RGB_OFF_B));
++			} else {
++				printf("[systemoff] led mode: %s\n", LED_MODE_STR[mode]);
++			}
++		} else {
++			printf("read led mode err\n");
++		}
++	} else {
++		mode = kbi_i2c_read(REG_LED_ON);
++		if ((mode >= LED_OFF_MODE) && (mode <= LED_RGB_HEARTBEAT_MODE)) {
++			if (LED_ON_MODE == mode || LED_OFF_MODE == mode) {
++				printf("[systemon] led mode: %s[R:0x%02x G:0x%02x B:0x%02x]\n", LED_MODE_STR[mode],
++					kbi_i2c_read(REG_LED_RGB_ON_R),
++					kbi_i2c_read(REG_LED_RGB_ON_G),
++					kbi_i2c_read(REG_LED_RGB_ON_B));
++			} else {
++				printf("[systemon] led mode: %s\n",LED_MODE_STR[mode]);
++			}
++		} else {
++			printf("read led mode err\n");
++		}
++	}
++}
++
++static int set_led_mode(int type, char *led, int mode)
++{
++	char cmd[128];
++	if (type == LED_SYSTEM_OFF) {
++
++		if (LED_OFF_MODE == mode || LED_ON_MODE == mode) {
++			if (LED_OFF_MODE == mode) {
++				if (0 == strcmp("r", led)) {
++						sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++									CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++									CHIP_ADDR, REG_LED_RGB_OFF_R, 0x0);
++				} else if (0 == strcmp("g", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_G, 0x0);
++				} else if (0 == strcmp("b", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_B, 0x0);
++				} else if (0 == strcmp("rg", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_R, 0x0,
++								CHIP_ADDR, REG_LED_RGB_OFF_G, 0x0);
++				} else if (0 == strcmp("rb", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_R, 0x0,
++								CHIP_ADDR, REG_LED_RGB_OFF_B, 0x0);
++				} else if (0 == strcmp("bg", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_G, 0x0,
++								CHIP_ADDR, REG_LED_RGB_OFF_B, 0x0);
++				} else if (0 == strcmp("rgb", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_OFF_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_R, 0x0,
++								CHIP_ADDR, REG_LED_RGB_OFF_G, 0x0,
++								CHIP_ADDR, REG_LED_RGB_OFF_B, 0x0);
++				}
++			} else {
++				if (0 == strcmp("r", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_R, 0xff);
++				} else if (0 == strcmp("g", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_G, 0xff);
++				} else if (0 == strcmp("b", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_B, 0xff);
++				} else if (0 == strcmp("rg", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_R, 0xff,
++								CHIP_ADDR, REG_LED_RGB_OFF_G, 0xff);
++				} else if (0 == strcmp("rb", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_R, 0xff,
++								CHIP_ADDR, REG_LED_RGB_OFF_B, 0xff);
++				} else if (0 == strcmp("bg", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_G, 0xff,
++								CHIP_ADDR, REG_LED_RGB_OFF_B, 0xff);
++				} else if (0 == strcmp("rgb", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_OFF, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_OFF_R, 0xff,
++								CHIP_ADDR, REG_LED_RGB_OFF_G, 0xff,
++								CHIP_ADDR, REG_LED_RGB_OFF_B, 0xff);
++				}
++			}
++		} else {
++			sprintf(cmd, "i2c mw %x %x %x 1",CHIP_ADDR, REG_LED_OFF, mode);
++		}
++	} else if (type == LED_SYSTEM_ON) {
++
++		if (LED_OFF_MODE == mode || LED_ON_MODE == mode) {
++			if (LED_OFF_MODE == mode) {
++				if (0 == strcmp("r", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_R, 0x0);
++				} else if (0 == strcmp("g", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_G, 0x0);
++				} else if (0 == strcmp("b", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_B, 0x0);
++				} else if (0 == strcmp("rg", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_R, 0x0,
++								CHIP_ADDR, REG_LED_RGB_ON_G, 0x0);
++				} else if (0 == strcmp("rb", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_R, 0x0,
++								CHIP_ADDR, REG_LED_RGB_ON_B, 0x0);
++				} else if (0 == strcmp("bg", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_G, 0x0,
++								CHIP_ADDR, REG_LED_RGB_ON_B, 0x0);
++				} else if (0 == strcmp("rgb", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_OFF_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_R, 0x0,
++								CHIP_ADDR, REG_LED_RGB_ON_G, 0x0,
++								CHIP_ADDR, REG_LED_RGB_ON_B, 0x0);
++				}
++			} else {
++				if (0 == strcmp("r", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_R, 0xff);
++				} else if (0 == strcmp("g", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_G, 0xff);
++				} else if (0 == strcmp("b", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_B, 0xff);
++				} else if (0 == strcmp("rg", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_R, 0xff,
++								CHIP_ADDR, REG_LED_RGB_ON_G, 0xff);
++				} else if (0 == strcmp("rb", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_R, 0xff,
++								CHIP_ADDR, REG_LED_RGB_ON_B, 0xff);
++				} else if (0 == strcmp("bg", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_G, 0xff,
++								CHIP_ADDR, REG_LED_RGB_ON_B, 0xff);
++				} else if (0 == strcmp("rgb", led)) {
++					sprintf(cmd, "i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1; i2c mw %x %x %x 1",
++								CHIP_ADDR, REG_LED_ON, LED_ON_MODE,
++								CHIP_ADDR, REG_LED_RGB_ON_R, 0xff,
++								CHIP_ADDR, REG_LED_RGB_ON_G, 0xff,
++								CHIP_ADDR, REG_LED_RGB_ON_B, 0xff);
++				}
++			}
++		} else {
++			sprintf(cmd, "i2c mw %x %x %x 1",CHIP_ADDR, REG_LED_ON, mode);
++		}
++
++	} else {
++		return CMD_RET_USAGE;
++	}
++
++	run_command(cmd, 0);
++    return 0;
++}
++
++static int do_kbi_init(cmd_tbl_t * cmdtp, int flag, int argc, char * const argv[])
++{
++	int khadas_camera_id = 0;//NULL
++
++	// switch to i2c2
++	printf("hlm %s\n", __func__);
++	run_command("i2c dev 3", 0);
++	khadas_camera_id = run_command("i2c md 0x0C 1", 0);//DW971
++	printf("khadas camera id=0x%x\n",khadas_camera_id);
++	if(khadas_camera_id == 0){//IMX415
++		run_command("fdt set /i2c@feab0000/os08a10f@36 status disable", 0);
++	} else {//OS08A10
++		run_command("fdt set /i2c@feab0000/imx415f@1a status disable", 0);
++		run_command("fdt set /i2c@feab0000/dw9714f@c status disable", 0);
++	}
++
++	run_command("i2c dev 4", 0);
++	khadas_camera_id = run_command("i2c md 0x0C 1", 0);//DW971
++	printf("khadas camera id=0x%x\n",khadas_camera_id);
++	if(khadas_camera_id == 0){//IMX415
++		run_command("fdt set /i2c@feac0000/os08a10b@36 status disable", 0);
++	} else {//OS08A10
++		run_command("fdt set /i2c@feac0000/imx415b@1a status disable", 0);
++		run_command("fdt set /i2c@feac0000/dw9714b@c status disable", 0);
++	}
++
++	run_command("i2c dev 8", 0);
++	khadas_camera_id = run_command("i2c md 0x0C 1", 0);//DW971
++	printf("khadas camera id=0x%x\n",khadas_camera_id);
++	if(khadas_camera_id == 0){//IMX415
++		run_command("fdt set /i2c@feca0000/os08a10@36 status disable", 0);
++	} else {//OS08A10
++		run_command("fdt set /i2c@feca0000/imx415@1a status disable", 0);
++		run_command("fdt set /i2c@feca0000/dw9714c@c status disable", 0);
++	}
++
++	run_command("i2c dev 2", 0);
++
++	return 0;
++}
++
++static int do_kbi_version(cmd_tbl_t * cmdtp, int flag, int argc, char * const argv[])
++{
++	get_version();
++	return 0;
++
++}
++
++static int do_kbi_usid(cmd_tbl_t * cmdtp, int flag, int argc, char * const argv[])
++{
++	get_usid();
++	return 0;
++}
++
++static int do_kbi_led(cmd_tbl_t * cmdtp, int flag, int argc, char * const argv[])
++{
++	int ret = 0;
++	int led_mode = 0;
++	char led_mode_str[32] = {0};
++	if (argc < 4)
++		return CMD_RET_USAGE;
++
++	if (strcmp(argv[1], "systemoff") ==0) {
++		if (strcmp(argv[2], "r") == 0) {
++			get_led_mode(LED_SYSTEM_OFF);
++		} else if (strcmp(argv[2], "w") == 0) {
++			if (argc < 5)
++				return CMD_RET_USAGE;
++
++			if (0 == strcmp(argv[4], "on") || 0 == strcmp(argv[4], "off")) {
++				if (0 != strcmp(argv[3], "r") &&
++					0 != strcmp(argv[3], "g") &&
++					0 != strcmp(argv[3], "b") &&
++					0 != strcmp(argv[3], "rg") &&
++					0 != strcmp(argv[3], "rb") &&
++					0 != strcmp(argv[3], "gb") &&
++					0 != strcmp(argv[3], "rgb"))
++					return CMD_RET_USAGE;
++				sprintf(led_mode_str, "%s", argv[4]);
++			} else
++				sprintf(led_mode_str, "%s_%s", argv[3], argv[4]);
++
++			led_mode = led_str_to_mode(led_mode_str);
++			if (led_mode < 0)
++				return CMD_RET_USAGE;
++
++			set_led_mode(LED_SYSTEM_OFF, argv[3], led_mode);
++
++		}
++	} else if (strcmp(argv[1], "systemon") ==0) {
++
++		if (strcmp(argv[2], "r") == 0) {
++			get_led_mode(LED_SYSTEM_ON);
++		} else if (strcmp(argv[2], "w") == 0) {
++			if (argc < 5)
++				return CMD_RET_USAGE;
++
++			if (0 == strcmp(argv[4], "on") || 0 == strcmp(argv[4], "off")) {
++				if (0 != strcmp(argv[3], "r") &&
++					0 != strcmp(argv[3], "g") &&
++					0 != strcmp(argv[3], "b") &&
++					0 != strcmp(argv[3], "rg") &&
++					0 != strcmp(argv[3], "rb") &&
++					0 != strcmp(argv[3], "gb") &&
++					0 != strcmp(argv[3], "rgb"))
++					return CMD_RET_USAGE;
++				sprintf(led_mode_str, "%s", argv[4]);
++			} else
++				sprintf(led_mode_str, "%s_%s", argv[3], argv[4]);
++
++			led_mode = led_str_to_mode(led_mode_str);
++			if (led_mode < 0)
++				return CMD_RET_USAGE;
++
++			set_led_mode(LED_SYSTEM_ON, argv[3], led_mode);
++		}
++	} else {
++		return CMD_RET_USAGE;
++	}
++	return ret;
++}
++
++static int do_kbi_trigger(cmd_tbl_t * cmdtp, int flag, int argc, char * const argv[])
++{
++	if (argc < 3)
++		return CMD_RET_USAGE;
++
++	if (strcmp(argv[2], "r") == 0) {
++
++		if (strcmp(argv[1], "rtc") == 0)
++			get_boot_enable(BOOT_EN_RTC);
++		else if (strcmp(argv[1], "dcin") == 0)
++			get_boot_enable(BOOT_EN_DCIN);
++		else
++			return CMD_RET_USAGE;
++	} else if (strcmp(argv[2], "w") == 0) {
++		if (argc < 4)
++			return CMD_RET_USAGE;
++		if ((strcmp(argv[3], "1") != 0) && (strcmp(argv[3], "0") != 0)) {
++			return CMD_RET_USAGE;
++		}
++
++		if (strcmp(argv[1], "rtc") == 0) {
++
++			if (strcmp(argv[3], "1") == 0)
++				set_boot_enable(BOOT_EN_RTC, 1);
++			else
++				set_boot_enable(BOOT_EN_RTC, 0);
++		} else if (strcmp(argv[1], "dcin") == 0) {
++			if (strcmp(argv[3], "1") == 0)
++				set_boot_enable(BOOT_EN_DCIN, 1);
++			else
++				set_boot_enable(BOOT_EN_DCIN, 0);
++		} else {
++			return CMD_RET_USAGE;
++		}
++	} else {
++		return CMD_RET_USAGE;
++	}
++
++	return 0;
++}
++
++
++static cmd_tbl_t cmd_kbi_sub[] = {
++	U_BOOT_CMD_MKENT(init, 1, 1, do_kbi_init, "", ""),
++	U_BOOT_CMD_MKENT(usid, 1, 1, do_kbi_usid, "", ""),
++	U_BOOT_CMD_MKENT(version, 1, 1, do_kbi_version, "", ""),
++	U_BOOT_CMD_MKENT(led, 4, 1, do_kbi_led, "", ""),
++	U_BOOT_CMD_MKENT(trigger, 4, 1, do_kbi_trigger, "", ""),
++};
++
++static int do_kbi(cmd_tbl_t * cmdtp, int flag, int argc, char * const argv[])
++{
++	cmd_tbl_t *c;
++
++	if (argc < 2)
++		return CMD_RET_USAGE;
++
++	/* Strip off leading 'kbi' command argument */
++	argc--;
++	argv++;
++
++	c = find_cmd_tbl(argv[0], &cmd_kbi_sub[0], ARRAY_SIZE(cmd_kbi_sub));
++
++	if (c)
++		return c->cmd(cmdtp, flag, argc, argv);
++	else
++		return CMD_RET_USAGE;
++
++}
++static char kbi_help_text[] =
++		"[function] [mode] [write|read] <value>\n"
++		"\n"
++		"kbi version - read version information\n"
++		"kbi usid - read usid information\n"
++		"\n"
++		"kbi led [systemoff|systemon] w [r|g|b|rg|rb|gb|rgb] <off|on|breathe|heartbeat> - set rgb led mode\n"
++		"kbi led [systemoff|systemon] r [r|g|b|rg|rb|gb|rgb] - read rgb led mode\n"
++		"\n"
++		"kbi trigger [rtc|dcin] w <0|1> - disable/enable boot trigger\n"
++		"kbi trigger [rtc|dcin] r - read mode of a boot trigger";
++
++
++U_BOOT_CMD(
++		kbi, 6, 1, do_kbi,
++		"Khadas Bootloader Instructions sub-system",
++		kbi_help_text
++);
+diff --git a/common/android_bootloader.c b/common/android_bootloader.c
+index ab080b81b5b..70801e71e60 100644
+--- a/common/android_bootloader.c
++++ b/common/android_bootloader.c
+@@ -418,7 +418,7 @@ char *android_assemble_cmdline(const char *slot_suffix,
+ 		*(current_chunk++) = allocated_suffix;
+ 	}
+ #endif
+-	serialno = env_get("serial#");
++	serialno = env_get("usid");
+ 	if (serialno) {
+ 		allocated_serialno = malloc(strlen(ANDROID_ARG_SERIALNO) +
+ 					  strlen(serialno) + 1);
+@@ -1369,7 +1369,16 @@ int android_bootloader_boot_flow(struct blk_desc *dev_desc,
+ 	/* Assemble the command line */
+ 	command_line = android_assemble_cmdline(slot_suffix, mode_cmdline);
+ 	env_update("bootargs", command_line);
+-
++	char lcd_id_buf[32] = {0};
++	extern int khadas_mipi_id;
++	snprintf(lcd_id_buf, 32, "khadas_mipi_id=%d", khadas_mipi_id);
++	env_update("bootargs", lcd_id_buf);
++	char lcd_id_buf2[32] = {0};
++	extern int is_mipi_lcd_exit;
++	snprintf(lcd_id_buf2, 32, "is_mipi_lcd_exit=%d", is_mipi_lcd_exit);
++	env_update("bootargs", lcd_id_buf2);
++	extern char hdmi_out_mode[32];
++	env_update("bootargs", hdmi_out_mode);
+ 	debug("ANDROID: bootargs: \"%s\"\n", command_line);
+ 
+ #ifdef CONFIG_SUPPORT_OEM_DTB
+diff --git a/common/autoboot.c b/common/autoboot.c
+index c64d566d1ca..bcd0e9549c1 100644
+--- a/common/autoboot.c
++++ b/common/autoboot.c
+@@ -216,11 +216,13 @@ static int __abortboot(int bootdelay)
+ #ifdef CONFIG_MENUPROMPT
+ 	printf(CONFIG_MENUPROMPT);
+ #else
+-	printf("Hit key to stop autoboot('CTRL+C'): %2d ", bootdelay);
++	//printf("Hit key to stop autoboot('CTRL+C'): %2d ", bootdelay);
++	printf("Hit any key to stop autoboot: %2d ", bootdelay);
+ #endif
+ 
+ #ifdef CONFIG_ARCH_ROCKCHIP
+-	if (!IS_ENABLED(CONFIG_CONSOLE_DISABLE_CLI) && ctrlc()) {	/* we press ctrl+c ? */
++	//if (!IS_ENABLED(CONFIG_CONSOLE_DISABLE_CLI) && ctrlc()) {	/* we press ctrl+c ? */
++	if (tstc()) {	/* we got a key press	*/
+ #else
+ 	/*
+ 	 * Check if key already pressed
+@@ -237,11 +239,13 @@ static int __abortboot(int bootdelay)
+ 		/* delay 1000 ms */
+ 		ts = get_timer(0);
+ 		do {
+-			if (ctrlc()) {	/* we got a ctrl+c key press	*/
++			//if (ctrlc()) {	/* we got a ctrl+c key press	*/
++			if (tstc()) {	/* we got a key press	*/
+ 				abort  = 1;	/* don't auto boot	*/
+ 				bootdelay = 0;	/* no more delay	*/
+ # ifdef CONFIG_MENUKEY
+-				menukey = 0x03;	/* ctrl+c key code */
++				//menukey = 0x03;	/* ctrl+c key code */
++				menukey = getc();
+ # endif
+ 				break;
+ 			}
+diff --git a/common/cli.c b/common/cli.c
+index d4074a7ef8b..da32fe823fa 100644
+--- a/common/cli.c
++++ b/common/cli.c
+@@ -215,7 +215,6 @@ err:
+ }
+ #endif /* CONFIG_IS_ENABLED(OF_CONTROL) */
+ 
+-#ifndef CONFIG_CONSOLE_DISABLE_CLI
+ void cli_loop(void)
+ {
+ #ifdef CONFIG_HUSH_PARSER
+@@ -228,9 +227,6 @@ void cli_loop(void)
+ 	printf("## U-Boot command line is disabled. Please enable CONFIG_CMDLINE\n");
+ #endif /*CONFIG_HUSH_PARSER*/
+ }
+-#else
+-void cli_loop(void) { }
+-#endif
+ 
+ void cli_init(void)
+ {
+diff --git a/configs/kedge2_defconfig b/configs/kedge2_defconfig
+new file mode 100644
+index 00000000000..5d66a9cda35
+--- /dev/null
++++ b/configs/kedge2_defconfig
+@@ -0,0 +1,242 @@
++CONFIG_ARM=y
++CONFIG_ARCH_ROCKCHIP=y
++CONFIG_SPL_GPIO_SUPPORT=y
++CONFIG_SPL_LIBCOMMON_SUPPORT=y
++CONFIG_SPL_LIBGENERIC_SUPPORT=y
++CONFIG_SYS_MALLOC_F_LEN=0x80000
++CONFIG_SPL_FIT_GENERATOR="arch/arm/mach-rockchip/make_fit_atf.sh"
++CONFIG_ROCKCHIP_RK3588=y
++CONFIG_ROCKCHIP_FIT_IMAGE=y
++CONFIG_ROCKCHIP_HWID_DTB=y
++CONFIG_ROCKCHIP_VENDOR_PARTITION=y
++CONFIG_USING_KERNEL_DTB_V2=y
++CONFIG_ROCKCHIP_FIT_IMAGE_PACK=y
++CONFIG_ROCKCHIP_NEW_IDB=y
++CONFIG_PSTORE=y
++CONFIG_SPL_SERIAL_SUPPORT=y
++CONFIG_SPL_DRIVERS_MISC_SUPPORT=y
++CONFIG_TARGET_EVB_RK3588=y
++CONFIG_SPL_LIBDISK_SUPPORT=y
++CONFIG_SPL_SPI_FLASH_SUPPORT=y
++CONFIG_SPL_SPI_SUPPORT=y
++CONFIG_DEFAULT_DEVICE_TREE="kedge2"
++CONFIG_DEBUG_UART=y
++CONFIG_FIT=y
++CONFIG_FIT_IMAGE_POST_PROCESS=y
++CONFIG_FIT_HW_CRYPTO=y
++CONFIG_SPL_LOAD_FIT=y
++CONFIG_SPL_FIT_IMAGE_POST_PROCESS=y
++CONFIG_SPL_FIT_HW_CRYPTO=y
++# CONFIG_SPL_SYS_DCACHE_OFF is not set
++CONFIG_BOOTDELAY=1
++CONFIG_SYS_CONSOLE_INFO_QUIET=y
++# CONFIG_DISPLAY_CPUINFO is not set
++CONFIG_ANDROID_BOOTLOADER=y
++CONFIG_ANDROID_AVB=y
++CONFIG_ANDROID_BOOT_IMAGE_HASH=y
++CONFIG_SPL_BOARD_INIT=y
++# CONFIG_SPL_RAW_IMAGE_SUPPORT is not set
++# CONFIG_SPL_LEGACY_IMAGE_SUPPORT is not set
++CONFIG_SPL_SEPARATE_BSS=y
++CONFIG_SYS_MMCSD_RAW_MODE_U_BOOT_USE_PARTITION=y
++CONFIG_SYS_MMCSD_RAW_MODE_U_BOOT_PARTITION=0x1
++CONFIG_SPL_MMC_WRITE=y
++CONFIG_SPL_MTD_SUPPORT=y
++CONFIG_SPL_ATF=y
++CONFIG_SPL_AB=y
++CONFIG_FASTBOOT_BUF_ADDR=0xc00800
++CONFIG_FASTBOOT_BUF_SIZE=0x07000000
++CONFIG_FASTBOOT_FLASH=y
++CONFIG_FASTBOOT_FLASH_MMC_DEV=0
++CONFIG_CMD_BOOTZ=y
++CONFIG_CMD_DTIMG=y
++# CONFIG_CMD_ELF is not set
++# CONFIG_CMD_IMI is not set
++# CONFIG_CMD_IMLS is not set
++# CONFIG_CMD_XIMG is not set
++# CONFIG_CMD_LZMADEC is not set
++# CONFIG_CMD_UNZIP is not set
++# CONFIG_CMD_FLASH is not set
++# CONFIG_CMD_FPGA is not set
++CONFIG_CMD_GPT=y
++CONFIG_CMD_I2C=y
++# CONFIG_CMD_LOADB is not set
++# CONFIG_CMD_LOADS is not set
++CONFIG_CMD_BOOT_ANDROID=y
++CONFIG_CMD_MMC=y
++CONFIG_CMD_SF=y
++CONFIG_CMD_SPI=y
++CONFIG_CMD_USB=y
++CONFIG_CMD_USB_MASS_STORAGE=y
++# CONFIG_CMD_ITEST is not set
++# CONFIG_CMD_SETEXPR is not set
++CONFIG_CMD_TFTPPUT=y
++CONFIG_CMD_TFTP_BOOTM=y
++CONFIG_CMD_TFTP_FLASH=y
++# CONFIG_CMD_MISC is not set
++CONFIG_CMD_MTD_BLK=y
++CONFIG_CMD_KHADAS_KBI=y
++# CONFIG_SPL_DOS_PARTITION is not set
++# CONFIG_ISO_PARTITION is not set
++CONFIG_EFI_PARTITION_ENTRIES_NUMBERS=64
++CONFIG_SPL_OF_CONTROL=y
++CONFIG_SPL_DTB_MINIMUM=y
++CONFIG_OF_LIVE=y
++CONFIG_OF_SPL_REMOVE_PROPS="clock-names interrupt-parent assigned-clocks assigned-clock-rates assigned-clock-parents"
++CONFIG_OF_U_BOOT_REMOVE_PROPS="pinctrl-0 pinctrl-names clock-names interrupt-parent assigned-clocks assigned-clock-rates assigned-clock-parents"
++# CONFIG_NET_TFTP_VARS is not set
++CONFIG_REGMAP=y
++CONFIG_SPL_REGMAP=y
++CONFIG_SYSCON=y
++CONFIG_SPL_SYSCON=y
++# CONFIG_SARADC_ROCKCHIP is not set
++CONFIG_SARADC_ROCKCHIP_V2=y
++CONFIG_CLK=y
++CONFIG_SPL_CLK=y
++CONFIG_CLK_SCMI=y
++CONFIG_SPL_CLK_SCMI=y
++CONFIG_DM_CRYPTO=y
++CONFIG_SPL_DM_CRYPTO=y
++CONFIG_ROCKCHIP_CRYPTO_V2=y
++CONFIG_SPL_ROCKCHIP_CRYPTO_V2=y
++CONFIG_DM_RNG=y
++CONFIG_RNG_ROCKCHIP=y
++CONFIG_SCMI_FIRMWARE=y
++CONFIG_SPL_SCMI_FIRMWARE=y
++CONFIG_GPIO_HOG=y
++CONFIG_ROCKCHIP_GPIO=y
++CONFIG_ROCKCHIP_GPIO_V2=y
++CONFIG_SYS_I2C_ROCKCHIP=y
++CONFIG_I2C_MUX=y
++CONFIG_DM_KEY=y
++CONFIG_RK8XX_PWRKEY=y
++CONFIG_ADC_KEY=y
++CONFIG_MISC=y
++CONFIG_SPL_MISC=y
++CONFIG_MISC_DECOMPRESS=y
++CONFIG_SPL_MISC_DECOMPRESS=y
++CONFIG_ROCKCHIP_OTP=y
++CONFIG_ROCKCHIP_HW_DECOMPRESS=y
++CONFIG_SPL_ROCKCHIP_HW_DECOMPRESS=y
++CONFIG_SPL_ROCKCHIP_SECURE_OTP=y
++CONFIG_MMC_DW=y
++CONFIG_MMC_DW_ROCKCHIP=y
++CONFIG_MMC_SDHCI=y
++CONFIG_MMC_SDHCI_SDMA=y
++CONFIG_MMC_SDHCI_ROCKCHIP=y
++CONFIG_MTD=y
++CONFIG_MTD_BLK=y
++CONFIG_MTD_DEVICE=y
++CONFIG_NAND=y
++CONFIG_MTD_SPI_NAND=y
++CONFIG_SPI_FLASH=y
++CONFIG_SF_DEFAULT_SPEED=80000000
++CONFIG_SPI_FLASH_EON=y
++CONFIG_SPI_FLASH_GIGADEVICE=y
++CONFIG_SPI_FLASH_MACRONIX=y
++CONFIG_SPI_FLASH_SST=y
++CONFIG_SPI_FLASH_WINBOND=y
++CONFIG_SPI_FLASH_XMC=y
++CONFIG_SPI_FLASH_XTX=y
++CONFIG_SPI_FLASH_MTD=y
++CONFIG_DM_ETH=y
++CONFIG_DM_ETH_PHY=y
++CONFIG_DWC_ETH_QOS=y
++CONFIG_GMAC_ROCKCHIP=y
++CONFIG_PHY_ROCKCHIP_INNO_USB2=y
++CONFIG_PHY_ROCKCHIP_SAMSUNG_HDPTX=y
++CONFIG_PHY_ROCKCHIP_USBDP=y
++CONFIG_PINCTRL=y
++CONFIG_SPL_PINCTRL=y
++CONFIG_DM_FUEL_GAUGE=y
++CONFIG_POWER_FG_CW201X=y
++CONFIG_POWER_FG_CW221X=y
++CONFIG_DM_PMIC=y
++CONFIG_PMIC_SPI_RK8XX=y
++CONFIG_DM_POWER_DELIVERY=y
++CONFIG_TYPEC_TCPM=y
++CONFIG_TYPEC_TCPCI=y
++CONFIG_TYPEC_HUSB311=y
++CONFIG_TYPEC_FUSB302=y
++CONFIG_REGULATOR_PWM=y
++CONFIG_DM_REGULATOR_FIXED=y
++CONFIG_DM_REGULATOR_GPIO=y
++CONFIG_REGULATOR_RK860X=y
++CONFIG_REGULATOR_RK806=y
++CONFIG_CHARGER_BQ25700=y
++CONFIG_CHARGER_BQ25890=y
++CONFIG_CHARGER_SC8551=y
++CONFIG_CHARGER_SGM41542=y
++CONFIG_DM_CHARGE_DISPLAY=y
++CONFIG_CHARGE_ANIMATION=y
++CONFIG_PWM_ROCKCHIP=y
++CONFIG_RAM=y
++CONFIG_SPL_RAM=y
++CONFIG_TPL_RAM=y
++CONFIG_DM_RAMDISK=y
++CONFIG_RAMDISK_RO=y
++CONFIG_DM_RESET=y
++CONFIG_SPL_DM_RESET=y
++CONFIG_SPL_RESET_ROCKCHIP=y
++CONFIG_BAUDRATE=1500000
++CONFIG_DEBUG_UART_BASE=0xFEB50000
++CONFIG_DEBUG_UART_CLOCK=24000000
++CONFIG_DEBUG_UART_SHIFT=2
++CONFIG_ROCKCHIP_SPI=y
++CONFIG_ROCKCHIP_SFC=y
++CONFIG_SYSRESET=y
++CONFIG_USB=y
++CONFIG_USB_XHCI_HCD=y
++CONFIG_USB_XHCI_DWC3=y
++CONFIG_USB_EHCI_HCD=y
++CONFIG_USB_EHCI_GENERIC=y
++CONFIG_USB_OHCI_HCD=y
++CONFIG_USB_OHCI_GENERIC=y
++CONFIG_USB_DWC3=y
++CONFIG_USB_DWC3_GADGET=y
++CONFIG_USB_DWC3_GENERIC=y
++CONFIG_USB_STORAGE=y
++CONFIG_USB_GADGET=y
++CONFIG_USB_GADGET_MANUFACTURER="Rockchip"
++CONFIG_USB_GADGET_VENDOR_NUM=0x2207
++CONFIG_USB_GADGET_PRODUCT_NUM=0x350a
++CONFIG_USB_GADGET_DOWNLOAD=y
++CONFIG_DM_VIDEO=y
++CONFIG_DISPLAY=y
++CONFIG_DRM_ROCKCHIP=y
++CONFIG_DRM_MAXIM_MAX96745=y
++CONFIG_DRM_MAXIM_MAX96755F=y
++CONFIG_DRM_PANEL_ROHM_BU18RL82=y
++CONFIG_DRM_PANEL_MAXIM_MAX96752F=y
++CONFIG_DRM_ROHM_BU18XL82=y
++CONFIG_DRM_ROCKCHIP_DW_HDMI_QP=y
++CONFIG_DRM_ROCKCHIP_DW_MIPI_DSI2=y
++CONFIG_DRM_ROCKCHIP_DW_DP=y
++CONFIG_DRM_ROCKCHIP_ANALOGIX_DP=y
++CONFIG_DRM_ROCKCHIP_SAMSUNG_MIPI_DCPHY=y
++CONFIG_PHY_ROCKCHIP_SAMSUNG_HDPTX_HDMI=y
++CONFIG_USE_TINY_PRINTF=y
++CONFIG_LIB_RAND=y
++CONFIG_SPL_TINY_MEMSET=y
++CONFIG_RSA=y
++CONFIG_SPL_RSA=y
++CONFIG_RSA_N_SIZE=0x200
++CONFIG_RSA_E_SIZE=0x10
++CONFIG_RSA_C_SIZE=0x20
++CONFIG_XBC=y
++CONFIG_LZ4=y
++CONFIG_LZMA=y
++CONFIG_ERRNO_STR=y
++# CONFIG_EFI_LOADER is not set
++CONFIG_AVB_LIBAVB=y
++CONFIG_AVB_LIBAVB_AB=y
++CONFIG_AVB_LIBAVB_ATX=y
++CONFIG_AVB_LIBAVB_USER=y
++CONFIG_RK_AVB_LIBAVB_USER=y
++CONFIG_OPTEE_CLIENT=y
++CONFIG_OPTEE_V2=y
++CONFIG_OPTEE_ALWAYS_USE_SECURITY_PARTITION=y
++CONFIG_SYS_PROMPT="kedge2# "
++CONFIG_CMD_GPIO=y
++CONFIG_CMD_I2C=y
++CONFIG_CMD_RUN=y
+diff --git a/drivers/clk/rockchip/clk_pll.c b/drivers/clk/rockchip/clk_pll.c
+index 49ddcc81a48..056ffaab5e6 100644
+--- a/drivers/clk/rockchip/clk_pll.c
++++ b/drivers/clk/rockchip/clk_pll.c
+@@ -166,71 +166,13 @@ rockchip_pll_clk_set_by_auto(ulong fin_hz,
+ 	return rate_table;
+ }
+ 
+-static u32
+-rockchip_rk3588_pll_k_get(u32 m, u32 p, u32 s, u64 fin_hz, u64 fvco)
+-{
+-	u64 fref, fout, ffrac;
+-	u32 k = 0;
+-
+-	fref = fin_hz / p;
+-	ffrac = fvco - (m * fref);
+-	fout = ffrac * 65536;
+-	k = fout / fref;
+-	if (k > 32767) {
+-		fref = fin_hz / p;
+-		ffrac = ((m + 1) * fref) - fvco;
+-		fout = ffrac * 65536;
+-		k = ((fout * 10 / fref) + 7) / 10;
+-		if (k > 32767)
+-			k = 0;
+-		else
+-			k = ~k + 1;
+-	}
+-	return k;
+-}
+-
+-static struct rockchip_pll_rate_table *
+-rockchip_rk3588_pll_frac_by_auto(unsigned long fin_hz, unsigned long fout_hz)
+-{
+-	struct rockchip_pll_rate_table *rate_table = &rockchip_auto_table;
+-	u32 p, m, s, k;
+-	u64 fvco;
+-
+-	for (s = 0; s <= 6; s++) {
+-		fvco = (u64)fout_hz << s;
+-		if (fvco < RK3588_VCO_MIN_HZ || fvco > RK3588_VCO_MAX_HZ)
+-			continue;
+-		for (p = 1; p <= 4; p++) {
+-			for (m = 64; m <= 1023; m++) {
+-				if ((fvco >= m * fin_hz / p) &&
+-				    (fvco < (m + 1) * fin_hz / p)) {
+-					k = rockchip_rk3588_pll_k_get(m, p, s,
+-								      fin_hz,
+-								      fvco);
+-					if (!k)
+-						continue;
+-					rate_table->p = p;
+-					rate_table->s = s;
+-					rate_table->k = k;
+-					if (k > 32767)
+-						rate_table->m = m + 1;
+-					else
+-						rate_table->m = m;
+-					return rate_table;
+-				}
+-			}
+-		}
+-	}
+-	return NULL;
+-}
+-
+ static struct rockchip_pll_rate_table *
+ rk3588_pll_clk_set_by_auto(unsigned long fin_hz,
+ 			   unsigned long fout_hz)
+ {
+ 	struct rockchip_pll_rate_table *rate_table = &rockchip_auto_table;
+ 	u32 p, m, s;
+-	ulong fvco;
++	ulong fvco, fref, fout, ffrac;
+ 
+ 	if (fin_hz == 0 || fout_hz == 0 || fout_hz == fin_hz)
+ 		return NULL;
+@@ -258,12 +200,27 @@ rk3588_pll_clk_set_by_auto(unsigned long fin_hz,
+ 		}
+ 		pr_err("CANNOT FIND Fout by auto,fout = %lu\n", fout_hz);
+ 	} else {
+-		rate_table = rockchip_rk3588_pll_frac_by_auto(fin_hz, fout_hz);
+-		if (!rate_table)
+-			pr_err("CANNOT FIND Fout by auto,fout = %lu\n",
+-			       fout_hz);
+-		else
+-			return rate_table;
++		for (s = 0; s <= 6; s++) {
++			fvco = fout_hz << s;
++			if (fvco < RK3588_VCO_MIN_HZ ||
++			    fvco > RK3588_VCO_MAX_HZ)
++				continue;
++			for (p = 1; p <= 4; p++) {
++				for (m = 64; m <= 1023; m++) {
++					if ((fvco >= m * fin_hz / p) && (fvco < (m + 1) * fin_hz / p)) {
++						rate_table->p = p;
++						rate_table->m = m;
++						rate_table->s = s;
++						fref = fin_hz / p;
++						ffrac = fvco - (m * fref);
++						fout = ffrac * 65536;
++						rate_table->k = fout / fref;
++						return rate_table;
++					}
++				}
++			}
++		}
++		pr_err("CANNOT FIND Fout by auto,fout = %lu\n", fout_hz);
+ 	}
+ 	return NULL;
+ }
+@@ -591,22 +548,11 @@ static ulong rk3588_pll_get_rate(struct rockchip_pll_clock *pll,
+ 
+ 		rate = OSC_HZ / p;
+ 		rate *= m;
+-		if (k & BIT(15)) {
+-			/* fractional mode */
+-			u64 frac_rate64;
+-
+-			k = (~(k - 1)) & RK3588_PLLCON2_K_MASK;
+-			frac_rate64 = OSC_HZ * k;
+-			postdiv = p;
+-			postdiv *= 65536;
+-			do_div(frac_rate64, postdiv);
+-			rate -= frac_rate64;
+-		} else {
++		if (k) {
+ 			/* fractional mode */
+ 			u64 frac_rate64 = OSC_HZ * k;
+ 
+-			postdiv = p;
+-			postdiv *= 65536;
++			postdiv = p * 65536;
+ 			do_div(frac_rate64, postdiv);
+ 			rate += frac_rate64;
+ 		}
+diff --git a/drivers/video/drm/dw_mipi_dsi2.c b/drivers/video/drm/dw_mipi_dsi2.c
+index fcd7cbe0eec..fe90add8983 100644
+--- a/drivers/video/drm/dw_mipi_dsi2.c
++++ b/drivers/video/drm/dw_mipi_dsi2.c
+@@ -15,6 +15,7 @@
+ #include <asm/gpio.h>
+ #include <asm/io.h>
+ #include <asm/hardware.h>
++#include <asm/gpio.h>
+ #include <dm/device.h>
+ #include <dm/read.h>
+ #include <dm/of_access.h>
+@@ -291,6 +292,8 @@ struct dw_mipi_dsi2 {
+ 
+ 	struct gpio_desc te_gpio;
+ 	struct mipi_dsi_device *device;
++	struct gpio_desc reset_gpio;
++	unsigned int reset_ms;
+ 	struct mipi_dphy_configure mipi_dphy_cfg;
+ 	const struct dw_mipi_dsi2_plat_data *pdata;
+ 	struct drm_dsc_picture_parameter_set *pps;
+@@ -1113,6 +1116,26 @@ static int dw_mipi_dsi2_connector_prepare(struct rockchip_connector *conn,
+ 	struct connector_state *conn_state = &state->conn_state;
+ 	unsigned long lane_rate;
+ 
++	if (dm_gpio_is_valid(&dsi2->reset_gpio))
++		dm_gpio_set_value(&dsi2->reset_gpio, 0);
++	if (dsi2->reset_ms)
++		mdelay(dsi2->reset_ms);
++
++	if (dm_gpio_is_valid(&dsi2->reset_gpio))
++		dm_gpio_set_value(&dsi2->reset_gpio, 1);
++	if (dsi2->reset_ms)
++		mdelay(dsi2->reset_ms);
++
++	if (dm_gpio_is_valid(&dsi2->reset_gpio))
++		dm_gpio_set_value(&dsi2->reset_gpio, 0);
++	if (dsi2->reset_ms)
++		mdelay(dsi2->reset_ms);
++
++	if (dm_gpio_is_valid(&dsi2->reset_gpio))
++		dm_gpio_set_value(&dsi2->reset_gpio, 1);
++	if (dsi2->reset_ms)
++		mdelay(dsi2->reset_ms);
++
+ 	memcpy(&dsi2->mode, &conn_state->mode, sizeof(struct drm_display_mode));
+ 	if (dsi2->slave)
+ 		memcpy(&dsi2->slave->mode, &dsi2->mode,
+@@ -1244,6 +1267,13 @@ static int dw_mipi_dsi2_probe(struct udevice *dev)
+ 	rockchip_connector_bind(&dsi2->connector, dev, id, &dw_mipi_dsi2_connector_funcs, NULL,
+ 				DRM_MODE_CONNECTOR_DSI);
+ 
++	dsi2->reset_ms = dev_read_u32_default(dev, "reset-delay-ms", 0);
++	ret = gpio_request_by_name(dev, "reset-gpios", 0,
++				   &dsi2->reset_gpio, GPIOD_IS_OUT);
++	if (ret && ret != -ENOENT) {
++		printf("%s: Cannot get reset GPIO: %d\n", __func__, ret);
++		return ret;
++	}
+ 	return 0;
+ }
+ 
+diff --git a/drivers/video/drm/rockchip_display.c b/drivers/video/drm/rockchip_display.c
+index 2eb91120199..147ee00ea16 100644
+--- a/drivers/video/drm/rockchip_display.c
++++ b/drivers/video/drm/rockchip_display.c
+@@ -58,7 +58,7 @@ static unsigned long cubic_lut_memory_start;
+ static unsigned long memory_end;
+ static struct base2_info base_parameter;
+ static u32 align_size = PAGE_SIZE;
+-
++int khadas_mipi_id = 0;
+ /*
+  * the phy types are used by different connectors in public.
+  * The current version only has inno hdmi phy for hdmi and tve.
+@@ -431,7 +431,14 @@ static int display_get_timing_from_dts(struct rockchip_panel *panel,
+ 	int ret;
+ 
+ 	mcu_panel = dev_read_subnode(panel->dev, "mcu-panel");
+-	dt = dev_read_subnode(panel->dev, "display-timings");
++
++    if(khadas_mipi_id == 2){//TS101
++	       dt = dev_read_subnode(panel->dev, "display-timings1");
++	}else if(khadas_mipi_id == 3){//new TS050
++	       dt = dev_read_subnode(panel->dev, "display-timings2");
++	}else{//old TS050
++	       dt = dev_read_subnode(panel->dev, "display-timings");
++	}
+ 	if (ofnode_valid(dt)) {
+ 		ret = ofnode_parse_phandle_with_args(dt, "native-mode", NULL,
+ 						     0, 0, &args);
+@@ -1153,6 +1160,7 @@ static int load_bmp_logo(struct logo_info *logo, const char *bmp_name)
+ 	int ret = 0;
+ 	int reserved = 0;
+ 	int dst_size;
++	char cmd[256] = {"0"};
+ 
+ 	if (!logo || !bmp_name)
+ 		return -EINVAL;
+@@ -1169,10 +1177,23 @@ static int load_bmp_logo(struct logo_info *logo, const char *bmp_name)
+ 	if (!header)
+ 		return -ENOMEM;
+ 
+-	len = rockchip_read_resource_file(header, bmp_name, 0, RK_BLK_SIZE);
+-	if (len != RK_BLK_SIZE) {
+-		ret = -EINVAL;
+-		goto free_header;
++//	len = rockchip_read_resource_file(header, bmp_name, 0, RK_BLK_SIZE);
++//	if (len != RK_BLK_SIZE) {
++//		ret = -EINVAL;
++//		goto free_header;
++//	}
++	sprintf(cmd, "ext4load mmc 0:9 0x%p %s %x", header, bmp_name, RK_BLK_SIZE);
++	printf("header load_bmp_logo cmd %s...\n", cmd);
++	if(run_command(cmd, 0)){
++		len = rockchip_read_resource_file(header, bmp_name, 0, RK_BLK_SIZE);
++		printf("header rockchip_read_resource_file len %d...\n", len);
++		if (len < 0) {
++			ret = -EINVAL;
++			goto free_header;
++		}
++	} else {
++		len = RK_BLK_SIZE;
++		printf("header load custom logo success...\n");
+ 	}
+ 
+ 	logo->bpp = get_unaligned_le16(&header->bit_count);
+@@ -1196,11 +1217,24 @@ static int load_bmp_logo(struct logo_info *logo, const char *bmp_name)
+ 		dst = pdst;
+ 	}
+ 
+-	len = rockchip_read_resource_file(pdst, bmp_name, 0, size);
+-	if (len != size) {
+-		printf("failed to load bmp %s\n", bmp_name);
+-		ret = -ENOENT;
+-		goto free_header;
++//	len = rockchip_read_resource_file(pdst, bmp_name, 0, size);
++//	if (len != size) {
++//		printf("failed to load bmp %s\n", bmp_name);
++//		ret = -ENOENT;
++//		goto free_header;
++//	}
++	sprintf(cmd, "ext4load mmc 0:9 0x%p %s %x", pdst, bmp_name, size);
++	printf("pdst load_bmp_logo cmd %s...\n", cmd);
++	if(run_command(cmd, 0)){
++		len = rockchip_read_resource_file(pdst, bmp_name, 0, size);
++		printf("pdst rockchip_read_resource_file len %d...\n", len);
++		if (len < 0) {
++			ret = -ENOENT;
++			goto free_header;
++		}
++	} else {
++		len = size;
++		printf("pdst load custom logo success...\n");
+ 	}
+ 
+ 	if (!can_direct_logo(logo->bpp)) {
+@@ -1833,12 +1867,6 @@ static int rockchip_display_probe(struct udevice *dev)
+ 		memset(s, 0, sizeof(*s));
+ 
+ 		INIT_LIST_HEAD(&s->head);
+-		ret = ofnode_read_string_index(node, "logo,uboot", 0, &name);
+-		if (!ret)
+-			memcpy(s->ulogo_name, name, strlen(name));
+-		ret = ofnode_read_string_index(node, "logo,kernel", 0, &name);
+-		if (!ret)
+-			memcpy(s->klogo_name, name, strlen(name));
+ 		ret = ofnode_read_string_index(node, "logo,mode", 0, &name);
+ 		if (!strcmp(name, "fullscreen"))
+ 			s->logo_mode = ROCKCHIP_DISPLAY_FULLSCREEN;
+@@ -1880,6 +1908,34 @@ static int rockchip_display_probe(struct udevice *dev)
+ 		s->crtc_state.crtc_id = get_crtc_id(np_to_ofnode(ep_node), is_ports_node);
+ 		s->node = node;
+ 
++		if(s->crtc_state.crtc_id == 0){
++			ret = ofnode_read_string_index(node, "logo,uboot", 0, &name);//0 degrees
++			if (!ret)
++				memcpy(s->ulogo_name, name, strlen(name));
++
++			ret = ofnode_read_string_index(node, "logo,uboot", 0, &name);
++			if (!ret)
++				memcpy(s->klogo_name, name, strlen(name));
++		}
++		else{
++			if(khadas_mipi_id == 2){
++				ret = ofnode_read_string_index(node, "logo,uboot", 0, &name);//0 degrees
++				if (!ret)
++					memcpy(s->ulogo_name, name, strlen(name));
++				ret = ofnode_read_string_index(node, "logo,uboot", 0, &name);
++				if (!ret)
++					memcpy(s->klogo_name, name, strlen(name));
++			}
++			else{
++				ret = ofnode_read_string_index(node, "logo,kernel", 0, &name);//90 degrees
++				if (!ret)
++					memcpy(s->ulogo_name, name, strlen(name));
++				ret = ofnode_read_string_index(node, "logo,kernel", 0, &name);
++				if (!ret)
++					memcpy(s->klogo_name, name, strlen(name));
++			}
++		}
++
+ 		if (is_ports_node) { /* only vop2 will get into here */
+ 			ofnode vp_node = np_to_ofnode(port_node);
+ 			static bool get_plane_mask_from_dts;
+diff --git a/drivers/video/drm/rockchip_panel.c b/drivers/video/drm/rockchip_panel.c
+index 9ddb4d8196d..26708027137 100644
+--- a/drivers/video/drm/rockchip_panel.c
++++ b/drivers/video/drm/rockchip_panel.c
+@@ -26,6 +26,9 @@
+ #include "rockchip_connector.h"
+ #include "rockchip_panel.h"
+ 
++int is_mipi_lcd_exit = 0x0;
++int vpx_id = 0;
++
+ struct rockchip_cmd_header {
+ 	u8 data_type;
+ 	u8 delay_ms;
+@@ -52,7 +55,7 @@ struct rockchip_panel_plat {
+ 		unsigned int unprepare;
+ 		unsigned int enable;
+ 		unsigned int disable;
+-		unsigned int reset;
++		//unsigned int reset;
+ 		unsigned int init;
+ 	} delay;
+ 
+@@ -67,7 +70,7 @@ struct rockchip_panel_priv {
+ 	struct udevice *backlight;
+ 	struct spi_slave *spi_slave;
+ 	struct gpio_desc enable_gpio;
+-	struct gpio_desc reset_gpio;
++	//struct gpio_desc reset_gpio;
+ 
+ 	int cmd_type;
+ 	struct gpio_desc spi_sdi_gpio;
+@@ -292,12 +295,14 @@ static int rockchip_panel_send_dsi_cmds(struct mipi_dsi_device *dsi,
+ 	return 0;
+ }
+ 
++extern int khadas_mipi_id;
+ static void panel_simple_prepare(struct rockchip_panel *panel)
+ {
+ 	struct rockchip_panel_plat *plat = dev_get_platdata(panel->dev);
+ 	struct rockchip_panel_priv *priv = dev_get_priv(panel->dev);
+ 	struct mipi_dsi_device *dsi = dev_get_parent_platdata(panel->dev);
+ 	int ret;
++	u8 mode;
+ 
+ 	if (priv->prepared)
+ 		return;
+@@ -311,18 +316,38 @@ static void panel_simple_prepare(struct rockchip_panel *panel)
+ 	if (plat->delay.prepare)
+ 		mdelay(plat->delay.prepare);
+ 
+-	if (dm_gpio_is_valid(&priv->reset_gpio))
+-		dm_gpio_set_value(&priv->reset_gpio, 1);
+-
+-	if (plat->delay.reset)
+-		mdelay(plat->delay.reset);
+-
+-	if (dm_gpio_is_valid(&priv->reset_gpio))
+-		dm_gpio_set_value(&priv->reset_gpio, 0);
+-
+ 	if (plat->delay.init)
+ 		mdelay(plat->delay.init);
+ 
++	mipi_dsi_dcs_get_power_mode(dsi, &mode);
++	if(0x8 == mode){
++		is_mipi_lcd_exit = is_mipi_lcd_exit | (0x1 << vpx_id);
++	}
++	else{
++		if(2 == vpx_id && 2!=khadas_mipi_id){
++			is_mipi_lcd_exit = is_mipi_lcd_exit & 0xb;
++			run_command("fdt set /dsi@fde20000 status disable", 0);
++			run_command("fdt set /dsi@fde20000/panel@0 status disable", 0);
++			run_command("fdt set /dsi@fde20000/ports/port@0/endpoint@0 status disable", 0);
++			run_command("fdt set /display-subsystem/route/route-dsi0 status disable", 0);
++			printf("disable dsi0\n");
++		}
++		else if(3 == vpx_id && 2!=khadas_mipi_id){
++			is_mipi_lcd_exit = is_mipi_lcd_exit & 0x7;
++			run_command("fdt set /dsi@fde30000 status disable", 0);
++			run_command("fdt set /dsi@fde30000/panel@0 status disable", 0);
++			run_command("fdt set /dsi@fde30000/ports/port@0/endpoint@1 status disable", 0);
++			run_command("fdt set /display-subsystem/route/route-dsi1 status disable", 0);
++			printf("disable dsi1\n");
++		}
++		printf("(vpx_id=%x)==(is_mipi_lcd_exit=%x)=vp2 and vp3 status disable\n", vpx_id,is_mipi_lcd_exit);
++	}
++	printf("0x8===>mode: 0x%d is_mipi_lcd_exit=%d\n", mode,is_mipi_lcd_exit);
++       /*ret = mipi_dsi_dcs_read(dsi, 0xDA, &khadas_mipi_id, sizeof(khadas_mipi_id));
++       if (ret <= 0) {
++               printf("mipi_dsi_dcs_read ID ,error=%d!!\n", ret);
++       }
++       printf("hlm panel_simple_prepare() khadas_mipi_id=%d\n", khadas_mipi_id);*/
+ 	if (plat->on_cmds) {
+ 		if (priv->cmd_type == CMD_TYPE_SPI)
+ 			ret = rockchip_panel_send_spi_cmds(panel, panel->state,
+@@ -335,7 +360,8 @@ static void panel_simple_prepare(struct rockchip_panel *panel)
+ 		if (ret)
+ 			printf("failed to send on cmds: %d\n", ret);
+ 	}
+-
++	//mipi_dsi_dcs_get_power_mode(dsi, &mode);
++	//printf("0x9c===>mode: 0x%x\n", mode);
+ 	priv->prepared = true;
+ }
+ 
+@@ -362,8 +388,8 @@ static void panel_simple_unprepare(struct rockchip_panel *panel)
+ 			printf("failed to send off cmds: %d\n", ret);
+ 	}
+ 
+-	if (dm_gpio_is_valid(&priv->reset_gpio))
+-		dm_gpio_set_value(&priv->reset_gpio, 1);
++	//if (dm_gpio_is_valid(&priv->reset_gpio))
++	//	dm_gpio_set_value(&priv->reset_gpio, 1);
+ 
+ 	if (dm_gpio_is_valid(&priv->enable_gpio))
+ 		dm_gpio_set_value(&priv->enable_gpio, 0);
+@@ -418,12 +444,97 @@ static const struct rockchip_panel_funcs rockchip_panel_funcs = {
+ 	.disable = panel_simple_disable,
+ };
+ 
++#ifdef CONFIG_DM_I2C
++#define TP_I2C_BUS_NUM 6
++#define TP05_CHIP_ADDR "0x38"
++#define TP10_CHIP_ADDR "0x14"
++static struct udevice *i2c_cur_bus;
++
++static int cmd_i2c_set_bus_num(unsigned int busnum)
++{
++    struct udevice *bus;
++    int ret;
++
++    ret = uclass_get_device_by_seq(UCLASS_I2C, busnum, &bus);
++    if (ret) {
++        printf("%s: No bus %d\n", __func__, busnum);
++        return ret;
++    }
++    i2c_cur_bus = bus;
++
++    return 0;
++}
++
++static int i2c_get_cur_bus(struct udevice **busp)
++{
++	if (!i2c_cur_bus) {
++		if (cmd_i2c_set_bus_num(TP_I2C_BUS_NUM)) {
++		    printf("Default I2C bus %d not found\n",
++		           TP_I2C_BUS_NUM);
++		    return -ENODEV;
++		}
++	}
++
++    if (!i2c_cur_bus) {
++        puts("No I2C bus selected\n");
++        return -ENODEV;
++    }
++    *busp = i2c_cur_bus;
++
++    return 0;
++}
++
++static int i2c_get_cur_bus_chip(uint chip_addr, struct udevice **devp)
++{
++    struct udevice *bus;
++    int ret;
++
++    ret = i2c_get_cur_bus(&bus);
++    if (ret)
++        return ret;
++
++    return i2c_get_chip(bus, chip_addr, 1, devp);
++}
++#endif
++
++static int kbi_i2c_read(uint reg, const char *cp)
++{
++	int ret;
++	char val[64];
++	uchar   linebuf[1];
++	uchar chip;
++#ifdef CONFIG_DM_I2C
++	struct udevice *dev;
++#endif
++
++
++	chip = simple_strtoul(cp, NULL, 16);
++
++#ifdef CONFIG_DM_I2C
++	ret = i2c_get_cur_bus_chip(chip, &dev);
++	if (!ret)
++		ret = dm_i2c_read(dev, reg, (uint8_t *)linebuf, 1);
++#else
++	ret = i2c_read(chip, reg, 1, linebuf, 1);
++#endif
++
++	if (ret)
++		printf("Error reading the chip: %d\n",ret);
++	else {
++		sprintf(val, "%d", linebuf[0]);
++		ret = simple_strtoul(val, NULL, 10);
++
++	}
++	return ret;
++}
++
+ static int rockchip_panel_ofdata_to_platdata(struct udevice *dev)
+ {
+ 	struct rockchip_panel_plat *plat = dev_get_platdata(dev);
+ 	const void *data;
+ 	int len = 0;
+ 	int ret;
++	static bool first_flag = 1;
+ 
+ 	plat->power_invert = dev_read_bool(dev, "power-invert");
+ 
+@@ -432,13 +543,39 @@ static int rockchip_panel_ofdata_to_platdata(struct udevice *dev)
+ 	plat->delay.enable = dev_read_u32_default(dev, "enable-delay-ms", 0);
+ 	plat->delay.disable = dev_read_u32_default(dev, "disable-delay-ms", 0);
+ 	plat->delay.init = dev_read_u32_default(dev, "init-delay-ms", 0);
+-	plat->delay.reset = dev_read_u32_default(dev, "reset-delay-ms", 0);
++	//plat->delay.reset = dev_read_u32_default(dev, "reset-delay-ms", 0);
+ 
+ 	plat->bus_format = dev_read_u32_default(dev, "bus-format",
+ 						MEDIA_BUS_FMT_RBG888_1X24);
+ 	plat->bpc = dev_read_u32_default(dev, "bpc", 8);
+ 
+-	data = dev_read_prop(dev, "panel-init-sequence", &len);
++	if(first_flag){
++		khadas_mipi_id = kbi_i2c_read(0xA8,TP05_CHIP_ADDR);
++		printf("TP05 id=0x%x\n",khadas_mipi_id);
++		if(khadas_mipi_id == 0x51){//old TS050
++			khadas_mipi_id = 1;
++		}else if(khadas_mipi_id == 0x79){//new TS050
++			khadas_mipi_id = 3;
++		}else{
++			khadas_mipi_id = kbi_i2c_read(0x9e,TP10_CHIP_ADDR);
++			printf("TP10 id=0x%x\n",khadas_mipi_id);
++			if(khadas_mipi_id == 0x00){//TS101
++				khadas_mipi_id = 2;
++			}else {
++				khadas_mipi_id = 0;
++			}
++		}
++		first_flag = 0;
++		printf("hlm khadas_mipi_id=%d\n",khadas_mipi_id);
++	}
++	if(3 == khadas_mipi_id){//new TS050
++		printf("new TS050 to parse panel init sequence2\n");
++		data = dev_read_prop(dev, "panel-init-sequence2", &len);
++	}
++	else{//old TS050
++		printf("old TS050 to parse panel init sequence\n");
++		data = dev_read_prop(dev, "panel-init-sequence", &len);
++	}
+ 	if (data) {
+ 		plat->on_cmds = calloc(1, sizeof(*plat->on_cmds));
+ 		if (!plat->on_cmds)
+@@ -490,12 +627,12 @@ static int rockchip_panel_probe(struct udevice *dev)
+ 		return ret;
+ 	}
+ 
+-	ret = gpio_request_by_name(dev, "reset-gpios", 0,
+-				   &priv->reset_gpio, GPIOD_IS_OUT);
+-	if (ret && ret != -ENOENT) {
+-		printf("%s: Cannot get reset GPIO: %d\n", __func__, ret);
+-		return ret;
+-	}
++	//ret = gpio_request_by_name(dev, "reset-gpios", 0,
++	//			   &priv->reset_gpio, GPIOD_IS_OUT);
++	//if (ret && ret != -ENOENT) {
++	//	printf("%s: Cannot get reset GPIO: %d\n", __func__, ret);
++	//	return ret;
++	//}
+ 
+ 	ret = uclass_get_device_by_phandle(UCLASS_PANEL_BACKLIGHT, dev,
+ 					   "backlight", &priv->backlight);
+@@ -557,7 +694,7 @@ static int rockchip_panel_probe(struct udevice *dev)
+ 			dm_gpio_set_value(&priv->spi_sdi_gpio, 1);
+ 			dm_gpio_set_value(&priv->spi_scl_gpio, 1);
+ 			dm_gpio_set_value(&priv->spi_cs_gpio, 1);
+-			dm_gpio_set_value(&priv->reset_gpio, 0);
++			//dm_gpio_set_value(&priv->reset_gpio, 0);
+ 		}
+ 	}
+ 
+diff --git a/drivers/video/drm/rockchip_vop2.c b/drivers/video/drm/rockchip_vop2.c
+index 33de5eae18e..6c3a9b00e6c 100644
+--- a/drivers/video/drm/rockchip_vop2.c
++++ b/drivers/video/drm/rockchip_vop2.c
+@@ -3703,6 +3703,7 @@ static void vop2_dither_setup(struct vop2 *vop2, int bus_format, int crtc_id)
+ 			DITHER_DOWN_MODE_SHIFT, dither_down_mode, false);
+ }
+ 
++char hdmi_out_mode[32];
+ static int rockchip_vop2_init(struct display_state *state)
+ {
+ 	struct crtc_state *cstate = &state->crtc_state;
+@@ -3743,6 +3744,8 @@ static int rockchip_vop2_init(struct display_state *state)
+ 	       get_output_if_name(conn_state->output_if, output_type_name),
+ 	       cstate->crtc_id);
+ 
++	snprintf(hdmi_out_mode, 32, "hdmimode=%dx%d", mode->crtc_hdisplay, mode->vdisplay);
++
+ 	if (mode->hdisplay > VOP2_MAX_VP_OUTPUT_WIDTH) {
+ 		cstate->splice_mode = true;
+ 		cstate->splice_crtc_id = vop2->data->vp_data[cstate->crtc_id].splice_vp_id;
+@@ -4482,6 +4485,8 @@ static int rockchip_vop2_set_plane(struct display_state *state)
+ 	if (ret)
+ 		return ret;
+ 
++extern int vpx_id;
++	vpx_id = cstate->crtc_id;
+ 	printf("VOP VP%d enable %s[%dx%d->%dx%d@%dx%d] fmt[%d] addr[0x%x]\n",
+ 		cstate->crtc_id, get_plane_name(primary_plane_id, plane_name),
+ 		cstate->src_rect.w, cstate->src_rect.h, cstate->crtc_rect.w, cstate->crtc_rect.h,
+diff --git a/include/boot_rkimg.h b/include/boot_rkimg.h
+index eb8b1ef086e..daab0805393 100644
+--- a/include/boot_rkimg.h
++++ b/include/boot_rkimg.h
+@@ -20,6 +20,7 @@ enum _boot_mode {
+ 	BOOT_MODE_WATCHDOG,
+ 	BOOT_MODE_DFU,
+ 	BOOT_MODE_QUIESCENT,
++	BOOT_MODE_REBOOT_TEST,
+ 	BOOT_MODE_UNDEFINE,
+ };
+ 
+diff --git a/include/configs/evb_rk3588.h b/include/configs/evb_rk3588.h
+index 737ee689450..73e1b0ef7be 100644
+--- a/include/configs/evb_rk3588.h
++++ b/include/configs/evb_rk3588.h
+@@ -14,7 +14,8 @@
+ #undef ROCKCHIP_DEVICE_SETTINGS
+ #define ROCKCHIP_DEVICE_SETTINGS \
+ 		"stdout=serial,vidconsole\0" \
+-		"stderr=serial,vidconsole\0"
++		"stderr=serial,vidconsole\0" \
++		"update=gpio clear 138; gpio clear 139; gpio set 140; rockusb 0 mmc 0\0"
+ 
+ #define CONFIG_SYS_MMC_ENV_DEV		0
+ 
+@@ -22,4 +23,4 @@
+ #define CONFIG_BOOTCOMMAND RKIMG_BOOTCOMMAND
+ 
+ #endif
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/configs/rk3588_common.h b/include/configs/rk3588_common.h
+index 13994689850..4cc51ba24e0 100644
+--- a/include/configs/rk3588_common.h
++++ b/include/configs/rk3588_common.h
+@@ -67,9 +67,11 @@
+ 	"scriptaddr=0x00500000\0" \
+ 	"pxefile_addr_r=0x00600000\0" \
+ 	"fdt_addr_r=0x08300000\0" \
++	"fdtbo_addr_r=0x05000000\0" \
+ 	"kernel_addr_r=0x00400000\0" \
+ 	"kernel_addr_c=0x05480000\0" \
+-	"ramdisk_addr_r=0x0a200000\0"
++	"ramdisk_addr_r=0x0a200000\0" \
++	"filesize_s=0x107b4a\0"
+ 
+ #include <config_distro_bootcmd.h>
+ 
+@@ -79,6 +81,14 @@
+ 	"partitions=" PARTS_RKIMG \
+ 	ROCKCHIP_DEVICE_SETTINGS \
+ 	RKIMG_DET_BOOTDEV \
++	"check_reboot_mode=" \
++	"if test X${reboot_mode} = Xreboot_test; then "\
++		"echo Reboot test mode detected;"\
++		"setenv bootargs ${bootargs} reboot_test;" \
++	"fi;"\
++	"kbi init;"\
++	"kbi usid;"\
++	"\0"\
+ 	BOOTENV
+ #endif
+ 
+@@ -86,7 +96,8 @@
+ #define CONFIG_USB_OHCI_NEW
+ #define CONFIG_SYS_USB_OHCI_MAX_ROOT_PORTS	1
+ 
+-#define CONFIG_PREBOOT
++#define CONFIG_PREBOOT \
++	 "run check_reboot_mode;"
+ #define CONFIG_LIB_HW_RAND
+ 
+ #endif
