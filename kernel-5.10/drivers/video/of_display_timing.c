@@ -140,7 +140,7 @@ EXPORT_SYMBOL_GPL(of_get_display_timing);
  * of_get_display_timings - parse all display_timing entries from a device_node
  * @np: device_node with the subnodes
  **/
-extern int khadas_mipi_id;
+int khadas_mipi_id;
 struct display_timings *of_get_display_timings(const struct device_node *np)
 {
 	struct device_node *timings_np;
